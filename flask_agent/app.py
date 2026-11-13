@@ -1,218 +1,134 @@
-import os
-import time
-import requests
+# Free multi-source search agent.
+# Tools: DuckDuckGo web/news, Reddit + X (via site: search), Wikipedia. No paid APIs.
+# LLM: Groq free tier if GROQ_API_KEY is set (use this for deployment), else local Ollama.
 
+import os
+from typing import TypedDict
+from urllib.parse import quote
+
+import requests
 from dotenv import load_dotenv
-from flask import Flask, render_template, request, jsonify
+from ddgs import DDGS
 
 from langchain.tools import tool
-from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 from langgraph.graph import StateGraph, END
+from langchain_ollama import ChatOllama
+from flask import Flask, jsonify, render_template, request
 
 load_dotenv()
 
-BRIGHTDATA_API_KEY = os.getenv("BRIGHTDATA_API_KEY")
-BRIGHTDATA_SERP_ZONE = os.getenv("BRIGHTDATA_SERP_ZONE")
-BRIGHTDATA_GPT_DATASET_ID = os.getenv("BRIGHTDATA_GPT_DATASET_ID")
-BRIGHTDATA_PERPLEXITY_DATASET_ID = os.getenv("BRIGHTDATA_PERPLEXITY_DATASET_ID")
-
-HEADERS = {
-    "Authorization": f"Bearer {BRIGHTDATA_API_KEY}",
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-}
+UA = {"User-Agent": "gen-search-eng/1.0 (learning project)"}
 
 
-@tool(description="Search using Google")
-def google_search(query):
-    print("Google tool being used...")
-
-    payload = {
-        "zone": BRIGHTDATA_SERP_ZONE,
-        "url": f"https://www.google.com/search?q={requests.utils.quote(query)}&brd_json=1",
-        "format": "raw",
-        "country": "US",
-    }
-
-    data = requests.post(
-        "https://api.brightdata.com/request?async=true",
-        headers=HEADERS,
-        json=payload,
-    ).json()
-
-    results = []
-
-    for item in data.get("organic", []):
-        results.append(
-            f"Title: {item['title']}\nLink: {item['link']}\nSnippet:{item.get('description', '')}"
-        )
-
-    return "\n\n".join(results)[:10000]
-
-
-@tool(description="Search using Bing")
-def bing_search(query):
-    print("Bing tool being used...")
-
-    payload = {
-        "zone": BRIGHTDATA_SERP_ZONE,
-        "url": f"https://www.bing.com/search?q={requests.utils.quote(query)}&brd_json=1",
-        "format": "raw",
-        "country": "US",
-    }
-
-    data = requests.post(
-        "https://api.brightdata.com/request?async=true",
-        headers=HEADERS,
-        json=payload,
-    ).json()
-
-    results = []
-    for item in data.get("organic", []):
-        results.append(
-            f"Title: {item['title']}\nLink: {item['link']}\nSnippet:{item.get('description', '')}"
-        )
-
-    return "\n\n".join(results)[:10000]
-
-
-@tool(description="Search on X / Twitter")
-def x_search(query):
-    print("X tool being used...")
-
-    payload = {
-        "zone": BRIGHTDATA_SERP_ZONE,
-        "url": f"https://www.google.com/search?q={requests.utils.quote('site:x.com ' + query)}&brd_json=1",
-        "format": "raw",
-        "country": "US",
-    }
-    data = requests.post(
-        "https://api.brightdata.com/request?async=true",
-        headers=HEADERS,
-        json=payload,
-    ).json()
-
-    results = []
-    for item in data.get("organic", []):
-        results.append(
-            f"Title: {item['title']}\nLink: {item['link']}\nSnippet:{item.get('description', '')}"
-        )
-
-    return "\n\n".join(results)[:10000]
-
-
-@tool(description="Search on Reddit")
-def reddit_search(query):
-    print("Reddit tool being used...")
-
-    payload = {
-        "zone": BRIGHTDATA_SERP_ZONE,
-        "url": f"https://www.google.com/search?q={requests.utils.quote('site:reddit.com ' + query)}&brd_json=1",
-        "format": "raw",
-        "country": "US",
-    }
-    data = requests.post(
-        "https://api.brightdata.com/request?async=true",
-        headers=HEADERS,
-        json=payload,
-    ).json()
-
-    results = []
-    for item in data.get("organic", []):
-        results.append(
-            f"Title: {item['title']}\nLink: {item['link']}\nSnippet:{item.get('description', '')}"
-        )
-
-    return "\n\n".join(results)[:10000]
-
-
-@tool(description="Use ChatGPT to get an answer to a question")
-def gpt_prompt(query):
-    print("GPT tool being used...")
-
-    payload = [{"url": "https://chatgpt.com/", "prompt": query}]
-    url = (
-        "https://api.brightdata.com/datasets/v3/trigger"
-        f"?dataset_id={BRIGHTDATA_GPT_DATASET_ID}"
-        "&format=json&custom_output_fields=answer_text_markdown"
+def _fmt(rows, link_key="href"):
+  if not rows:
+    return "No results."
+  out = []
+  for r in rows:
+    out.append(
+      f"Title: {r.get('title')}\nLink: {r.get(link_key)}\nSnippet: {r.get('body', '')}"
     )
-
-    response = requests.post(url, headers=HEADERS, json=payload)
-    snapshot_id = response.json()["snapshot_id"]
-
-    while (
-        requests.get(
-            f"https://api.brightdata.com/datasets/v3/progress/{snapshot_id}",
-            headers=HEADERS,
-        ).json()["status"]
-        != "ready"
-    ):
-        time.sleep(5)
-
-    data = requests.get(
-        f"https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format=json",
-        headers=HEADERS,
-    ).json()[0]
-
-    return data["answer_text_markdown"]
+  return "\n\n".join(out)[:8000]
 
 
-@tool(description="Use Perplexity to research a question with sources")
-def perplexity_prompt(query):
-    print("Perplexity tool being used...")
+def _ddg_text(q, n=6):
+  try:
+    return _fmt(DDGS().text(q, max_results=n))
+  except Exception as e:  # return the error to the agent instead of crashing the run
+    return f"Search failed: {e}"
 
-    payload = [{"url": "https://www.perplexity.ai/", "prompt": query}]
-    url = (
-        "https://api.brightdata.com/datasets/v3/trigger"
-        f"?dataset_id={BRIGHTDATA_PERPLEXITY_DATASET_ID}"
-        "&format=json&custom_output_fields=answer_text_markdown|sources"
+
+@tool(description="General web search (DuckDuckGo). Use first for most questions.")
+def web_search(query: str) -> str:
+  print("Web search is being used...")
+  return _ddg_text(query)
+
+
+@tool(description="Recent news search. Use for current events and latest developments.")
+def news_search(query: str) -> str:
+  print("News search is being used...")
+  try:
+    return _fmt(DDGS().news(query, max_results=6), link_key="url")
+  except Exception as e:
+    return f"Search failed: {e}"
+
+
+@tool(description="Search Reddit discussions and opinions.")
+def reddit_search(query: str) -> str:
+  print("Reddit is being used...")
+  return _ddg_text(f"site:reddit.com {query}")
+
+
+@tool(description="Search X (Twitter) posts and profiles.")
+def x_search(query: str) -> str:
+  print("X is being used...")
+  return _ddg_text(f"site:x.com {query}")
+
+
+@tool(description="Look up background/encyclopedic info on a person, place, concept or company (Wikipedia).")
+def wikipedia_search(query: str) -> str:
+  print("Wikipedia is being used...")
+  try:
+    r = requests.get(
+      "https://en.wikipedia.org/w/api.php",
+      params={"action": "query", "list": "search", "srsearch": query, "srlimit": 3, "format": "json"},
+      headers=UA, timeout=15,
     )
+    hits = r.json()["query"]["search"]
+    if not hits:
+      return "No Wikipedia results."
+    out = []
+    for h in hits:
+      title = h["title"]
+      s = requests.get(
+        f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(title.replace(' ', '_'))}",
+        headers=UA, timeout=15,
+      )
+      if s.status_code != 200:
+        continue
+      j = s.json()
+      link = j.get("content_urls", {}).get("desktop", {}).get("page", "")
+      out.append(f"Title: {title}\nLink: {link}\nSummary: {j.get('extract', '')}")
+    return "\n\n".join(out) or "No Wikipedia results."
+  except Exception as e:
+    return f"Wikipedia lookup failed: {e}"
 
-    response = requests.post(url, headers=HEADERS, json=payload)
-    snapshot_id = response.json()["snapshot_id"]
 
-    while (
-        requests.get(
-            f"https://api.brightdata.com/datasets/v3/progress/{snapshot_id}",
-            headers=HEADERS,
-        ).json()["status"]
-        != "ready"
-    ):
-        time.sleep(5)
-
-    data = requests.get(
-        f"https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format=json",
-        headers=HEADERS,
-    ).json()[0]
-
-    return data["answer_text_markdown"] + "\n\n" + str(data.get("sources", []))
+def get_llm():
+  if os.getenv("GROQ_API_KEY"):
+    from langchain_groq import ChatGroq
+    return ChatGroq(model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"), temperature=0)
+  return ChatOllama(model=os.getenv("OLLAMA_MODEL", "qwen2.5:3b"), temperature=0)
 
 
-llm = ChatOpenAI(model_name="gpt-4o", temperature=0)
+SYSTEM_PROMPT = (
+  "Only state numbers, dates, names and claims that appear in the tool results. "
+  "If a detail is not in the results, leave it out rather than guessing. "
+  "Do not repeat a search with a near-identical query; call each tool at most twice. "
+)
 
-agent = create_react_agent(
-    model=llm,
-    tools=[
-        google_search,
-        bing_search,
-        gpt_prompt,
-        perplexity_prompt,
-        x_search,
-        reddit_search,
-    ],
-    debug=False,
-    prompt="Use all tools at your disposal to answer user questions. Always use at least two tools. Preferably more. When giving an answer aggregate and summarize all information you get. Always provide a complete list of all sources which you used to find the information you provided. Make sure to add ALL links and sources here. Not just a few superficial ones."
+agent = create_agent(
+  model=get_llm(),
+  tools=[web_search, news_search, wikipedia_search, reddit_search, x_search],
+  system_prompt=SYSTEM_PROMPT,
 )
 
 
-def agent_node(state):
-    result = agent.invoke({"messages": [("human", state["query"])]})
-    state["answer"] = result["messages"][-1].content
-    return state
+class State(TypedDict, total=False):
+  query: str
+  answer: str
 
 
-graph = StateGraph(dict)
+def agent_node(state: State) -> State:
+  result = agent.invoke(
+    {"messages": [("human", state["query"])]},
+    config={"recursion_limit": 12},
+  )
+  return {"answer": result["messages"][-1].content}
+
+
+graph = StateGraph(State)
 graph.add_node("agent", agent_node)
 graph.set_entry_point("agent")
 graph.add_edge("agent", END)
